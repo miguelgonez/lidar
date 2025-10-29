@@ -1,0 +1,6 @@
+aoi:
+  name: velez-malaga
+  bbox: [-4.25, 36.70, -4.00, 36.85]   # W,S,E,N
+  utm_zone: 30
+  max_downloads: 5        # tiles 1×1 km (reduced for demo)
+  laz_version: 3c2025
