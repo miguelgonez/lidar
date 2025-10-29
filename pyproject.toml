@@ -1,0 +1,17 @@
+[project]
+name = "repl-nix-workspace"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.11"
+dependencies = [
+    "aiofiles>=25.1.0",
+    "aiohttp>=3.13.2",
+    "folium>=0.20.0",
+    "geopandas>=1.1.1",
+    "google-genai>=1.46.0",
+    "pillow>=11.3.0",
+    "pyyaml>=6.0.3",
+    "rasterio>=1.4.3",
+    "scipy>=1.16.3",
+    "streamlit>=1.50.0",
+]
