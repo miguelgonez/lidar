@@ -1,0 +1,27 @@
+{
+  "pipeline": [
+    {
+      "type": "readers.las",
+      "filename": "data/laz/*.laz"
+    },
+    {
+      "type": "filters.smrf",
+      "scalar": 1.25,
+      "slope": 0.2,
+      "threshold": 0.45,
+      "cut": 0.0
+    },
+    {
+      "type": "filters.range",
+      "limits": "Classification[2:2]"
+    },
+    {
+      "type": "writers.gdal",
+      "filename": "data/dem_velez.tif",
+      "resolution": 1,
+      "output_type": "idw",
+      "window_size": 6,
+      "gdalopts": "COMPRESS=ZSTD,TILED=YES,BIGTIFF=YES"
+    }
+  ]
+}
