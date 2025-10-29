@@ -1,0 +1,230 @@
+A continuación tienes todo el árbol de archivos (carpeta lidar-velez/) listo para comprimir con:
+bash
+Copy
+zip -r lidar-velez.zip lidar-velez/
+Copia-pega cada bloque en su ruta correspondiente y tendrás el proyecto completo.
+lidar-velez/config.yaml
+yaml
+Copy
+aoi:
+  name: velez-malaga
+  bbox: [-4.25, 36.70, -4.00, 36.85]   # W,S,E,N
+  utm_zone: 30
+  gcs_bucket: gs://TU-BUCKET-lidar/velez/
+  gee_project: projects/TU-PROYECTO/assets/pnoa3_velez/
+  max_downloads: 50        # tiles 1×1 km
+  laz_version: 3c2025
+lidar-velez/requirements.txt
+Copy
+aiohttp>=3.9
+aiofiles>=23.0
+geopandas>=0.14
+pyyaml>=6.0
+rasterio>=1.3
+google-cloud-storage>=2.10
+earthengine-api>=0.1.380
+google-cloud-aiplatform>=1.38
+streamlit>=1.28
+scipy>=1.11
+lidar-velez/pipelines/laz2dem.json
+JSON
+Copy
+{
+  "pipeline": [
+    { "type": "readers.las", "filename": "data/laz/*.laz" },
+    { "type": "filters.smrf", "scalar": 1.25, "slope": 0.2, "threshold": 0.45, "cut": 0.0 },
+    { "type": "filters.range", "limits": "Classification[2:2]" },
+    { "type": "writers.gdal", "filename": "data/dem_velez.tif",
+      "resolution": 1, "output_type": "idw", "window_size": 6,
+      "gdalopts": "COMPRESS=ZSTD,TILED=YES,BIGTIFF=YES" }
+  ]
+}
+lidar-velez/src/download.py
+Python
+Copy
+import asyncio, aiohttp, aiofiles, geopandas as gpd
+from shapely.geometry import box
+import yaml, os, math
+
+with open("config.yaml") as f:
+    C = yaml.safe_load(f)
+BBOX = C["aoi"]["bbox"]
+OUT = "data/laz"
+os.makedirs(OUT, exist_ok=True)
+
+INDEX_URL = ("https://centrodedescargas.cnig.es/CentroDescargas/"
+             "documentos/PDT_LIDAR3_2025.zip")
+
+async def download_laz(session, sem, url, path):
+    async with sem:
+        async with session.get(url) as r:
+            if r.status == 200:
+                async with aiofiles.open(path, "wb") as f:
+                    async for chunk in r.content.iter_chunked(1024*64):
+                        await f.write(chunk)
+
+async def main():
+    idx = gpd.read_file(INDEX_URL).to_crs(4326)
+    tiles = idx[idx.intersects(box(*BBOX))].head(C["aoi"]["max_downloads"])
+    sem = asyncio.Semaphore(6)
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for _, row in tiles.iterrows():
+            url = row.URL_DESCARGA
+            fname = f"{row.HOJA}.laz"
+            tasks.append(download_laz(session, sem, url, f"{OUT}/{fname}"))
+        await asyncio.gather(*tasks)
+    print(f"✅ Descargados {len(tasks)} LAZ")
+
+if __name__ == "__main__":
+    import aiohttp
+    asyncio.run(main())
+lidar-velez/src/process.py
+Python
+Copy
+import subprocess, os, rasterio
+from glob import glob
+os.makedirs("data/deriv", exist_ok=True)
+
+def hill_multi(dem):
+    for az in (45, 90, 135, 180, 225, 270, 315, 360):
+        out = f"data/deriv/hill_{az}.tif"
+        subprocess.run(["gdaldem", "hillshade", "-az", str(az),
+                        "-alt", "45", "-compute_edges", dem, out])
+
+def svf(dem):
+    with rasterio.open(dem) as src:
+        arr = src.read(1)
+        meta = src.meta
+    from scipy.ndimage import maximum_filter
+    rad = 25
+    maxf = maximum_filter(arr, size=rad)
+    svf = 1 - (maxf - arr) / (arr + 30)
+    meta.update(dtype="float32")
+    with rasterio.open("data/deriv/svf.tif", "w", **meta) as dst:
+        dst.write(svf.astype("float32"), 1)
+
+if __name__ == "__main__":
+    hill_multi("data/dem_velez.tif")
+    svf("data/dem_velez.tif")
+lidar-velez/src/gee_upload.py
+Python
+Copy
+import subprocess, os, yaml
+with open("config.yaml") as f:
+    C = yaml.safe_load(f)
+pre = C["aoi"]["gee_project"]
+bucket = C["aoi"]["gcs_bucket"]
+files = ["dem_velez.tif"] + [f"hill_{a}.tif" for a in (45,90,135,180,225,270,315,360)] + ["svf.tif"]
+for tif in files:
+    asset = pre + os.path.splitext(tif)[0]
+    cmd = ["earthengine", "upload", "image",
+           "--asset_id", asset,
+           "--pyramiding_policy", "MODE",
+           "--crs", "EPSG:4326",
+           bucket + tif]
+    subprocess.run(cmd)
+lidar-velez/src/detect.py
+Python
+Copy
+import ee, yaml, vertexai, json
+from vertexai.preview.generative_models import GenerativeModel, Image
+
+ee.Initialize()
+with open("config.yaml") as f:
+    C = yaml.safe_load(f)
+
+dem  = ee.Image(C["aoi"]["gee_project"] + "dem_velez")
+hill = ee.Image(C["aoi"]["gee_project"] + "hill_45")
+svf  = ee.Image(C["aoi"]["gee_project"] + "svf")
+aoi  = ee.Geometry.Rectangle(C["aoi"]["bbox"])
+
+thumb = dem.getThumbURL({"min":0,"max":300,"dimensions":1024,"region":aoi})
+hill_u = hill.getThumbURL({"min":0,"max":255,"dimensions":1024,"region":aoi})
+svf_u  = svf.getThumbURL({"min":-1,"max":1,"dimensions":1024,"region":aoi})
+
+vertexai.init(project="TU-PROYECTO", location="us-central1")
+model = GenerativeModel("gemini-1.5-pro")
+prompt = """
+Eres un arqueólogo experto en LiDAR. Observa MDT, hillshade y SVF de Vélez-Málaga.
+1. Identifica 10 anomalías (lineales/circulares) susceptibles de ser estructuras ocultas.
+2. Devuelve únicamente un GeoJSON FeatureCollection con:
+   - point: centro aproximado
+   - properties: {tipo: 'muro|túmulo|fossa|camino', score: 0-1, justificación}
+Sin texto adicional.
+"""
+response = model.generate_content([
+    prompt,
+    Image.load_from_file(thumb),
+    Image.load_from_file(hill_u),
+    Image.load_from_file(svf_u)
+])
+geojson_str = response.text[response.text.find("{"):response.text.rfind("}")+1]
+with open("outputs/anomalies.geojson", "w") as f:
+    f.write(geojson_str)
+print("✅ GeoJSON guardado en outputs/anomalies.geojson")
+lidar-velez/src/app.py
+Python
+Copy
+import streamlit as st, geemap, ee, yaml
+with open("config.yaml") as f:
+    C = yaml.safe_load(f)
+st.set_page_config(layout="wide")
+st.title("LiDAR Vélez-Málaga – Anomalías detectadas")
+Map = geemap.Map(center=[36.78, -4.10], zoom=12)
+dem = ee.Image(C["aoi"]["gee_project"] + "dem_velez")
+Map.addLayer(dem, {"min":0,"max":300,"palette":["006633","E5FFCC","662A00"]}, "DEM 1 m")
+Map.add_geojson("outputs/anomalies.geojson", layer_name="Anomalías IA")
+Map.addLayerControl()
+st.components.v1.html(Map.to_html(), height=700)
+st.download_button("Descargar GeoJSON", data=open("outputs/anomalies.geojson").read(),
+                   file_name="velez_anomalies.geojson", mime="application/json")
+lidar-velez/Dockerfile
+dockerfile
+Copy
+FROM osgeo/gdal:ubuntu-small-3.8.4
+RUN apt update && apt install -y pdal python3-pd python3-pip
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+COPY . /app
+WORKDIR /app
+EXPOSE 8080
+CMD ["streamlit", "run", "src/app.py", "--server.port=8080", "--server.address=0.0.0.0"]
+lidar-velez/.dockerignore
+Copy
+data/
+outputs/
+__pycache__/
+*.log
+lidar-velez/README.md
+Markdown
+Copy
+Code
+Preview
+# lidar-velez
+Pipeline completo para detectar estructuras ocultas con PNOA-LiDAR 3ª cobertura (set-2025) en Vélez-Málaga.
+
+## Uso rápido
+1. Cambia `TU-BUCKET` y `TU-PROYECTO` en `config.yaml`.  
+2. Crea entorno:  
+   `conda env create -f environment.yml` (o `pip install -r requirements.txt`)  
+3. Autentica:  
+   `gcloud auth login && earthengine authenticate`  
+4. Ejecuta pasos:  
+   ```bash
+   python src/download.py
+   pdal pipeline pipelines/laz2dem.json
+   python src/process.py
+   gsutil -m cp data/*.tif data/deriv/*.tif gs://TU-BUCKET/velez/
+   python src/gee_upload.py
+   # espera a que terminen las tareas (earthengine task list)
+   python src/detect.py
+   streamlit run src/app.py
+Docker
+bash
+Copy
+docker build -t lidar-velez .
+docker run -p 8080:8080 \
+  -v $HOME/.config/earthengine:/root/.config/earthengine \
+  -v $HOME/.config/gcloud:/root/.config/gcloud \
+  lidar-velez
